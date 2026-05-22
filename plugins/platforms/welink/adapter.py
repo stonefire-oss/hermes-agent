@@ -1168,12 +1168,9 @@ class WeLinkAdapter(BasePlatformAdapter):
 
     async def _handle_create_session_action(self, welink_session_id: Optional[str], payload: Dict[str, Any]) -> None:
         """Handle create_session action."""
-        tool_session_id = str(uuid.uuid4())
-        
-        # Record mapping
-        if welink_session_id and self._gateway:
-            self._gateway.record_session_mapping(welink_session_id, tool_session_id)
-        
+        # TEST: Use welinkSessionId directly as toolSessionId (eliminate mapping layer)
+        tool_session_id = welink_session_id or str(uuid.uuid4())
+
         # Send session_created response
         if self._gateway:
             await self._gateway.send_session_created(
