@@ -1,0 +1,59 @@
+name: welink-platform
+label: WeLink (华为企业通信)
+kind: platform
+version: 1.0.0
+description: >
+  WeLink gateway adapter for Hermes Agent.
+  Connects to WeLink via ai-gateway WebSocket bridge and relays messages
+  between WeLink chats and the Hermes agent. Implements the message-bridge
+  protocol for bidirectional communication with ai-gateway.
+author: Hermes Agent Team
+
+# WeLink 通过 ai-gateway 连接，需要 AK/SK 鉴权
+requires_env:
+  - name: WELINK_AK
+    description: "WeLink Access Key (AK) for ai-gateway authentication"
+    prompt: "WeLink Access Key"
+    password: false
+  - name: WELINK_SK
+    description: "WeLink Secret Key (SK) for ai-gateway authentication"
+    prompt: "WeLink Secret Key"
+    password: true
+  - name: WELINK_GATEWAY_URL
+    description: "ai-gateway WebSocket URL (e.g., ws://localhost:8081/ws/agent)"
+    prompt: "Gateway WebSocket URL"
+    password: false
+
+optional_env:
+  - name: WELINK_CHANNEL
+    description: "Bridge channel identifier (default: welink)"
+    prompt: "Channel name"
+    password: false
+  - name: WELINK_ALLOWED_USERS
+    description: "Comma-separated WeLink user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: WELINK_ALLOW_ALL_USERS
+    description: "Allow any WeLink user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: WELINK_HOME_CHANNEL
+    description: "Default chat ID for cron / notification delivery"
+    prompt: "Home channel (or empty)"
+    password: false
+  - name: WELINK_HOME_CHANNEL_NAME
+    description: "Display name for the WeLink home channel"
+    prompt: "Home channel display name"
+    password: false
+  - name: WELINK_HEARTBEAT_INTERVAL_MS
+    description: "Heartbeat interval in milliseconds (default: 30000)"
+    prompt: "Heartbeat interval (ms)"
+    password: false
+  - name: WELINK_RECONNECT_BASE_MS
+    description: "Reconnect base delay in milliseconds (default: 1000)"
+    prompt: "Reconnect base delay (ms)"
+    password: false
+  - name: WELINK_SDK_TIMEOUT_MS
+    description: "SDK call timeout in milliseconds (default: 10000)"
+    prompt: "SDK timeout (ms)"
+    password: false
