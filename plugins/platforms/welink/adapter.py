@@ -180,8 +180,8 @@ class WeLinkAdapter(BasePlatformAdapter):
         payload = msg.get("payload", {})
 
         logger.info(
-            "welink.invoke.received: action=%s welinkSessionId=%s",
-            action, welink_session_id,
+            "welink.invoke.received: action=%s welinkSessionId=%s payload=%s",
+            action, welink_session_id, payload,
         )
 
         # Route to action handler
@@ -307,10 +307,37 @@ class WeLinkAdapter(BasePlatformAdapter):
         logger.info("welink.abort_session: tool_session_id=%s", tool_session_id)
 
     async def _handle_question_reply_action(self, welink_session_id: Optional[str], payload: Dict[str, Any]) -> None:
-        """Handle question_reply action - resolves pending clarify."""
-        request_id = payload.get("requestId")
-        if request_id and request_id in self._pending_actions:
-            self._pending_actions[request_id].set_result(payload)
+        """Handle question_reply action - resolves pending clarify.
+
+        Gateway-schema defines question_reply payload as:
+        { questionId: string, answer: string }
+
+        questionId maps to the clarify_id we sent in send_clarify.
+        This method bridges the WeLink question_reply to Hermes gateway's
+        clarify primitive by calling resolve_gateway_clarify().
+        """
+
+        # Try multiple possible field names for question ID
+        # WeLink uses 'toolCallId', OpenCode uses 'id', Legacy uses 'questionId'
+        question_id = payload.get("toolCallId") or payload.get("questionId") or payload.get("id") or payload.get("callID")
+        answer = payload.get("answer", "")
+
+        if not question_id:
+            logger.warning("welink.question_reply.missing_questionId")
+            return
+
+        # Resolve the gateway clarify primitive (unblocks agent thread)
+        from tools.clarify_gateway import resolve_gateway_clarify
+        resolved = resolve_gateway_clarify(question_id, answer)
+
+        if resolved:
+            logger.info("welink.question_reply.resolved: question_id=%s answer=%s", question_id, answer)
+        else:
+            logger.warning("welink.question_reply.not_found: question_id=%s (no pending clarify)", question_id)
+
+        # Also clean up local pending_actions if present (legacy fallback)
+        if question_id in self._pending_actions:
+            self._pending_actions.pop(question_id, None)
 
     def _handle_status_query(self, msg: Dict[str, Any]) -> None:
         """Handle status_query from gateway."""
@@ -460,9 +487,9 @@ class WeLinkAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a clarify prompt to WeLink via skill event protocol.
+        """Send a clarify prompt to WeLink via OpenCode provider event protocol.
 
-        Uses `send_skill_event` with event_type="question" to render WeLink's
+        Uses `send_tool_event` with event_type="question.asked" to render WeLink's
         selection UI. The user's response comes back via `question_reply` action,
         which is handled by `_handle_question_reply_action`.
 
@@ -483,40 +510,49 @@ class WeLinkAdapter(BasePlatformAdapter):
 
         logger.info("welink.clarify.send: clarify_id=%s choices=%s", clarify_id, choices)
 
-        # Build question properties for skill event
-        properties = {
-            "id": clarify_id,  # requestID for matching reply
-            "text": question,
-            "sessionKey": session_key,
+        # Generate UUIDs for OpenCode protocol required fields
+        message_id = str(uuid.uuid4())
+        call_id = f"call_{message_id[:8]}"
+
+        # Build question properties using OpenCode provider event format
+        # Reference: /opt/welink-wecode-legacy-skill-plugin/packages/gateway-schema/src/contract/schemas/tool-event/opencode-provider-event/question.ts
+        # OpenCode format: sessionID, id (questionId), questions[], tool{messageID, callID}
+        question_item = {
+            "question": question,
         }
 
         # Add choices if provided (multiple-choice mode)
         if choices:
-            properties["options"] = [
-                {"id": str(i), "text": choice}
-                for i, choice in enumerate(choices, start=1)
-            ]
+            question_item["options"] = [{"label": choice} for choice in choices]
             # Add "Other" option for free-text input
-            properties["options"].append({"id": "other", "text": "Other (type your answer)"})
-            properties["mode"] = "selection"
-        else:
-            properties["mode"] = "text"
+            question_item["options"].append({"label": "Other (type your answer)"})
 
-        # Send question event via skill provider protocol
-        success = await self._gateway.send_skill_event(
+        properties = {
+            "sessionID": chat_id,
+            "id": clarify_id,  # OpenCode format: question id
+            "questionId": clarify_id,  # WeLink expected field for reply correlation
+            "questions": [question_item],
+            "tool": {
+                "messageID": message_id,
+                "callID": clarify_id,  # Use clarify_id as callID for correlation
+            },
+        }
+
+        # Send question.asked event via OpenCode provider protocol
+        success = await self._gateway.send_tool_event(
             tool_session_id=chat_id,
-            event_type="question",
+            event_type="question.asked",
             properties=properties,
         )
 
         if success:
-            logger.info("welink.clarify.sent: clarify_id=%s", clarify_id)
+            logger.info("welink.clarify.sent: clarify_id=%s format=opencode", clarify_id)
             # Track pending clarify for response matching
             self._pending_actions[clarify_id] = asyncio.get_running_loop().create_future()
             return SendResult(success=True, message_id=clarify_id)
         else:
             logger.error("welink.clarify.send_failed")
-            return SendResult(success=False, error="Failed to send question event")
+            return SendResult(success=False, error="Failed to send question.asked event")
 
     async def permission_callback(
         self,
