@@ -56,6 +56,51 @@ logger = logging.getLogger(__name__)
 # WeLink Adapter
 # =============================================================================
 
+
+# =============================================================================
+# Security Configuration
+# =============================================================================
+
+class SecurityConfig:
+    """Security configuration for access control.
+    
+    Attributes:
+        allowed_users: List of allowed user accounts (sendUserAccount).
+            - Empty list = no users allowed (deny all) - DEFAULT
+            - Contains "ALL" = all users allowed (allow all)
+        allowed_groups: List of allowed group IDs (groupId from imGroupId).
+            - Empty list = no groups allowed (deny all)
+            - Contains "ALL" = all groups allowed (allow all) - DEFAULT
+    
+    Note: User and group checks are case-insensitive.
+    """
+    
+    def __init__(
+        self,
+        allowed_users: Optional[List[str]] = None,
+        allowed_groups: Optional[List[str]] = None,
+    ):
+        # Normalize to lowercase for case-insensitive comparison
+        self.allowed_users = [u.lower() for u in (allowed_users or [])]
+        self.allowed_groups = [g.lower() for g in (allowed_groups or ["ALL"])]
+    
+    def is_user_allowed(self, send_user_account: str) -> bool:
+        """Check if user is allowed to use the bot (case-insensitive)."""
+        if "all" in self.allowed_users:
+            return True
+        return send_user_account.lower() in self.allowed_users
+    
+    def is_group_allowed(self, im_group_id: Optional[str]) -> bool:
+        """Check if group is allowed (case-insensitive)."""
+        if "all" in self.allowed_groups:
+            return True
+        if not im_group_id:
+            return True
+        group_id = im_group_id.split("#")[0].lower() if "#" in im_group_id else im_group_id.lower()
+        return group_id in self.allowed_groups
+
+
+
 class WeLinkAdapter(BasePlatformAdapter):
     """WeLink platform adapter connecting Hermes to ai-gateway.
 
@@ -76,6 +121,9 @@ class WeLinkAdapter(BasePlatformAdapter):
 
         # Parse bridge configuration from PlatformConfig
         self._bridge_config = self._parse_bridge_config(config)
+
+        # Parse security configuration (access control)
+        self._access_control = self._parse_access_control(config)
 
         # Gateway connection
         self._gateway: Optional[GatewayConnection] = None
@@ -125,6 +173,37 @@ class WeLinkAdapter(BasePlatformAdapter):
                 max_elapsed_ms=int(extra.get("reconnect_max_elapsed_ms") or 600000),
             ),
         )
+
+    def _parse_access_control(self, config: PlatformConfig) -> SecurityConfig:
+        """Parse SecurityConfig from PlatformConfig.
+        
+        Configuration in config.yaml under platforms.welink.extra.security:
+            security:
+                allowed_users: ["y00453483"]  # or ["ALL"]
+                allowed_groups: ["ALL"]
+        """
+        extra = config.extra or {}
+        security = extra.get("security", {})
+        
+        # Parse allowed_users (default: empty = deny all)
+        allowed_users_raw = security.get("allowed_users", [])
+        if isinstance(allowed_users_raw, str):
+            allowed_users = [allowed_users_raw]
+        else:
+            allowed_users = list(allowed_users_raw) if allowed_users_raw else []
+        
+        # Parse allowed_groups (default: ["ALL"] = allow all)
+        allowed_groups_raw = security.get("allowed_groups", ["ALL"])
+        if isinstance(allowed_groups_raw, str):
+            allowed_groups = [allowed_groups_raw]
+        else:
+            allowed_groups = list(allowed_groups_raw) if allowed_groups_raw else ["ALL"]
+        
+        return SecurityConfig(
+            allowed_users=allowed_users,
+            allowed_groups=allowed_groups,
+        )
+
 
     async def connect(self) -> bool:
         """Connect to ai-gateway WebSocket."""
@@ -212,6 +291,55 @@ class WeLinkAdapter(BasePlatformAdapter):
     async def _handle_chat_action(self, welink_session_id: Optional[str], payload: Dict[str, Any]) -> None:
         """Handle chat action - user message to process."""
         tool_session_id = payload.get("toolSessionId")
+        send_user_account = payload.get("sendUserAccount", "")
+        im_group_id = payload.get("imGroupId")  # Only present for group messages
+
+        # Security check: verify user and group authorization
+        is_group_msg = im_group_id is not None
+
+        if is_group_msg:
+            # Group message: check both group and user
+            if not self._access_control.is_group_allowed(im_group_id):
+                logger.warning(
+                    "welink.security.group_denied: group_id=%s user=%s",
+                    im_group_id, send_user_account
+                )
+                await self.send(
+                    chat_id=tool_session_id,
+                    content="未授权用户禁止使用",
+                    metadata={"welink_session_id": welink_session_id},
+                )
+                return
+            if not self._access_control.is_user_allowed(send_user_account):
+                logger.warning(
+                    "welink.security.user_denied_in_group: user=%s group=%s",
+                    send_user_account, im_group_id
+                )
+                await self.send(
+                    chat_id=tool_session_id,
+                    content="未授权用户禁止使用",
+                    metadata={"welink_session_id": welink_session_id},
+                )
+                return
+        else:
+            # DM message: check user only
+            if not self._access_control.is_user_allowed(send_user_account):
+                logger.warning(
+                    "welink.security.user_denied: user=%s",
+                    send_user_account
+                )
+                await self.send(
+                    chat_id=tool_session_id,
+                    content="未授权用户禁止使用",
+                    metadata={"welink_session_id": welink_session_id},
+                )
+                return
+
+        logger.info(
+            "welink.security.allowed: user=%s group=%s",
+            send_user_account, im_group_id or "DM"
+        )
+
         text = payload.get("text", "")
 
         if not tool_session_id:
