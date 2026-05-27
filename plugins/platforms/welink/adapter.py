@@ -85,6 +85,11 @@ class WeLinkAdapter(BasePlatformAdapter):
 
         # Pending actions waiting for user response (clarify, permission, etc.)
         self._pending_actions: Dict[str, asyncio.Future] = {}
+        
+        # Store session info for each confirm_id (needed for slash_confirm resolution)
+        self._confirm_session_keys: Dict[str, Dict[str, str]] = {}
+        # Store welink_session_id for each session_key (for slash_confirm)
+        self._session_welink_ids: Dict[str, str] = {}
 
         # Agent message handler (set by gateway runner)
         self._agent_handler: Optional[Callable] = None
@@ -179,10 +184,7 @@ class WeLinkAdapter(BasePlatformAdapter):
         welink_session_id = msg.get("welinkSessionId")
         payload = msg.get("payload", {})
 
-        logger.info(
-            "welink.invoke.received: action=%s welinkSessionId=%s payload=%s",
-            action, welink_session_id, payload,
-        )
+
 
         # Route to action handler
         if action == "chat":
@@ -236,6 +238,11 @@ class WeLinkAdapter(BasePlatformAdapter):
             user_id=welink_session_id or "unknown",
             thread_id=None,
         )
+        
+        # Store welink_session_id for this session (needed for slash_confirm)
+        session_key = f"agent:main:welink:dm:{tool_session_id}"
+        if welink_session_id:
+            self._session_welink_ids[session_key] = welink_session_id
 
         event = MessageEvent(
             source=source,
@@ -296,10 +303,52 @@ class WeLinkAdapter(BasePlatformAdapter):
             self._sessions.pop(tool_session_id, None)
 
     async def _handle_permission_reply_action(self, welink_session_id: Optional[str], payload: Dict[str, Any]) -> None:
-        """Handle permission_reply action - resolves pending permission_callback."""
-        request_id = payload.get("requestId")
-        if request_id and request_id in self._pending_actions:
-            self._pending_actions[request_id].set_result(payload)
+        """Handle permission_reply action - resolves pending slash_confirm.
+        
+        Gateway schema returns permissionId and response ('once', 'always', 'cancel').
+        We need to call slash_confirm.resolve() to execute the actual command.
+        """
+        # Try multiple possible field names: permissionId (Gateway schema), id (sent), requestId (legacy)
+        permission_id = payload.get("permissionId") or payload.get("id") or payload.get("requestId")
+        response = payload.get("response", "once")  # 'once', 'always', or 'cancel'
+        
+        # Get session_key and welink_session_id from stored mapping (set during send_slash_confirm)
+        session_info = self._confirm_session_keys.get(permission_id)
+        session_key = session_info.get("session_key") if session_info else None
+        stored_welink_session_id = session_info.get("welink_session_id") if session_info else None
+        
+        logger.info("welink.permission_reply.lookup: permission_id=%s session_key=%s welink_session_id=%s stored_keys=%s", 
+                    permission_id, session_key, stored_welink_session_id, list(self._confirm_session_keys.keys())[:5])
+        
+        if permission_id and session_key:
+            # Call slash_confirm.resolve to execute the command handler
+            from tools import slash_confirm as slash_confirm_mod
+            
+            # Debug: check what's in slash_confirm._pending
+            pending = slash_confirm_mod.get_pending(session_key)
+            logger.info("welink.slash_confirm.pending_check: session_key=%s pending=%s", 
+                        session_key, pending)
+            
+            result = await slash_confirm_mod.resolve(session_key, permission_id, response)
+            logger.info("welink.permission_reply.resolved: permission_id=%s response=%s result=%s", 
+                        permission_id, response, result[:50] if result else "None")
+            
+            # Send the result to the user
+            if result:
+                # Extract chat_id from session_key: "agent:main:welink:dm:ses_xxx"
+                chat_id = session_key.split(":")[-1] if ":" in session_key else session_key
+                await self.send(chat_id, result, metadata={"welink_session_id": stored_welink_session_id})
+                logger.info("welink.permission_reply.sent: chat_id=%s result_len=%d welink_session_id=%s", 
+                            chat_id, len(result), stored_welink_session_id)
+            
+            # Also clean up local pending_actions if present (legacy fallback)
+            if permission_id in self._pending_actions:
+                self._pending_actions.pop(permission_id, None)
+            
+            # Clean up session_key mapping
+            self._confirm_session_keys.pop(permission_id, None)
+        else:
+            logger.warning("welink.permission_reply.missing_permissionId")
 
     async def _handle_abort_session_action(self, welink_session_id: Optional[str], payload: Dict[str, Any]) -> None:
         """Handle abort_session action."""
@@ -669,11 +718,23 @@ class WeLinkAdapter(BasePlatformAdapter):
             logger.warning("welink.slash_confirm.not_connected")
             return SendResult(success=False, error="Gateway not connected")
 
-        logger.info("welink.slash_confirm.send: confirm_id=%s title=%s", confirm_id, title)
+        # Store session_key and welink_session_id for later resolution
+        # Get welink_session_id from metadata or from stored mapping
+        welink_session_id = metadata.get("welink_session_id") if metadata else None
+        if not welink_session_id:
+            welink_session_id = self._session_welink_ids.get(session_key)
+        self._confirm_session_keys[confirm_id] = {
+            "session_key": session_key,
+            "welink_session_id": welink_session_id,
+        }
+        logger.info("welink.slash_confirm.send: confirm_id=%s title=%s session_key=%s welink_session_id=%s", 
+                    confirm_id, title, session_key, welink_session_id)
 
         # Build confirmation properties using permission.ask event type
+        # Use permissionId for Gateway schema compatibility, keep id for fallback
         properties = {
-            "id": confirm_id,
+            "permissionId": confirm_id,  # Gateway schema expected field
+            "id": confirm_id,            # Fallback for compatibility
             "title": title,
             "text": message,
             "sessionKey": session_key,
