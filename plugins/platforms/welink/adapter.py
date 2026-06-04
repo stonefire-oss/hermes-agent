@@ -138,6 +138,9 @@ class WeLinkAdapter(BasePlatformAdapter):
         self._confirm_session_keys: Dict[str, Dict[str, str]] = {}
         # Store welink_session_id for each session_key (for slash_confirm)
         self._session_welink_ids: Dict[str, str] = {}
+        # Store session_key for each approval_id (for gateway exec_approval)
+        # Keyed by approval_id (not session_key) to match permission_reply payload
+        self._exec_approval_state: Dict[str, str] = {}
 
         # Agent message handler (set by gateway runner)
         self._agent_handler: Optional[Callable] = None
@@ -431,22 +434,67 @@ class WeLinkAdapter(BasePlatformAdapter):
             self._sessions.pop(tool_session_id, None)
 
     async def _handle_permission_reply_action(self, welink_session_id: Optional[str], payload: Dict[str, Any]) -> None:
-        """Handle permission_reply action - resolves pending slash_confirm.
+        """Handle permission_reply action - resolves pending slash_confirm or exec_approval.
         
-        Gateway schema returns permissionId and response ('once', 'always', 'cancel').
-        We need to call slash_confirm.resolve() to execute the actual command.
+        Gateway schema returns permissionId and response ('once', 'always', 'cancel', 'session', 'deny').
+        
+        Two sources:
+        1. exec_approval: permission_id in _exec_approval_state -> call resolve_gateway_approval()
+        2. slash_confirm: permission_id in _confirm_session_keys -> call slash_confirm.resolve()
         """
         # Try multiple possible field names: permissionId (Gateway schema), id (sent), requestId (legacy)
         permission_id = payload.get("permissionId") or payload.get("id") or payload.get("requestId")
-        response = payload.get("response", "once")  # 'once', 'always', or 'cancel'
+        response = payload.get("response", "once")  # 'once', 'always', 'session', 'deny', or 'cancel'
         
-        # Get session_key and welink_session_id from stored mapping (set during send_slash_confirm)
+        logger.info(
+            "welink.permission_reply.lookup: permission_id=%s response=%s exec_approval_keys=%s confirm_keys=%s",
+            permission_id,
+            response,
+            list(self._exec_approval_state.keys())[:5],
+            list(self._confirm_session_keys.keys())[:5],
+        )
+        
+        # Check if this is an exec_approval response (gateway exec_approval primitive)
+        if permission_id in self._exec_approval_state:
+            session_key = self._exec_approval_state.get(permission_id)
+            
+            logger.info(
+                "welink.permission_reply.exec_approval: permission_id=%s session_key=%s response=%s",
+                permission_id,
+                session_key,
+                response,
+            )
+            
+            # Import and call resolve_gateway_approval
+            from tools.approval import resolve_gateway_approval
+            
+            # Map response to choice: once/session/always/deny
+            choice = response  # Gateway already sends 'once', 'session', 'always', 'deny'
+            
+            # Resolve the approval (unblocks agent thread)
+            resolved_count = resolve_gateway_approval(session_key, choice)
+            
+            logger.info(
+                "welink.exec_approval.resolved: permission_id=%s session_key=%s choice=%s resolved_count=%d",
+                permission_id,
+                session_key,
+                choice,
+                resolved_count,
+            )
+            
+            # Clean up exec_approval state
+            self._exec_approval_state.pop(permission_id, None)
+            
+            # Also clean up pending_actions if present
+            if permission_id in self._pending_actions:
+                self._pending_actions.pop(permission_id, None)
+            
+            return
+        
+        # Otherwise, handle as slash_confirm response
         session_info = self._confirm_session_keys.get(permission_id)
         session_key = session_info.get("session_key") if session_info else None
         stored_welink_session_id = session_info.get("welink_session_id") if session_info else None
-        
-        logger.info("welink.permission_reply.lookup: permission_id=%s session_key=%s welink_session_id=%s stored_keys=%s", 
-                    permission_id, session_key, stored_welink_session_id, list(self._confirm_session_keys.keys())[:5])
         
         if permission_id and session_key:
             # Call slash_confirm.resolve to execute the command handler
@@ -454,20 +502,31 @@ class WeLinkAdapter(BasePlatformAdapter):
             
             # Debug: check what's in slash_confirm._pending
             pending = slash_confirm_mod.get_pending(session_key)
-            logger.info("welink.slash_confirm.pending_check: session_key=%s pending=%s", 
-                        session_key, pending)
+            logger.info(
+                "welink.slash_confirm.pending_check: session_key=%s pending=%s",
+                session_key,
+                pending,
+            )
             
             result = await slash_confirm_mod.resolve(session_key, permission_id, response)
-            logger.info("welink.permission_reply.resolved: permission_id=%s response=%s result=%s", 
-                        permission_id, response, result[:50] if result else "None")
+            logger.info(
+                "welink.permission_reply.resolved: permission_id=%s response=%s result=%s",
+                permission_id,
+                response,
+                result[:50] if result else "None",
+            )
             
             # Send the result to the user
             if result:
                 # Extract chat_id from session_key: "agent:main:welink:dm:ses_xxx"
                 chat_id = session_key.split(":")[-1] if ":" in session_key else session_key
                 await self.send(chat_id, result, metadata={"welink_session_id": stored_welink_session_id})
-                logger.info("welink.permission_reply.sent: chat_id=%s result_len=%d welink_session_id=%s", 
-                            chat_id, len(result), stored_welink_session_id)
+                logger.info(
+                    "welink.permission_reply.sent: chat_id=%s result_len=%d welink_session_id=%s",
+                    chat_id,
+                    len(result),
+                    stored_welink_session_id,
+                )
             
             # Also clean up local pending_actions if present (legacy fallback)
             if permission_id in self._pending_actions:
@@ -654,6 +713,85 @@ class WeLinkAdapter(BasePlatformAdapter):
     # =========================================================================
     # Clarify / Permission / Slash Confirm UI Methods
     # =========================================================================
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a dangerous command approval request to WeLink via permission.ask event.
+
+        Used by gateway's exec_approval primitive for dangerous terminal commands.
+
+        Uses `send_skill_event` with event_type="permission.ask" to render WeLink's
+        approval UI with buttons. The user's response comes back via `permission_reply`
+        action, which is handled by `_handle_permission_reply_action`.
+
+        Args:
+            chat_id: Session ID to send to
+            command: The dangerous command that needs approval
+            session_key: Session key for gateway routing
+            description: Why this command is considered dangerous
+            metadata: Additional metadata
+
+        Returns:
+            SendResult indicating success/failure
+        """
+        if self._gateway is None or self._gateway.state != ConnectionState.READY:
+            logger.warning("welink.exec_approval.not_connected")
+            return SendResult(success=False, error="Gateway not connected")
+
+        # Generate unique approval_id
+        approval_id = str(uuid.uuid4())[:8]
+
+        # Store session_key for this approval_id (for resolution in permission_reply)
+        self._exec_approval_state[approval_id] = session_key
+
+        logger.info(
+            "welink.exec_approval.send: approval_id=%s command=%s session_key=%s",
+            approval_id,
+            command[:50] if len(command) > 50 else command,
+            session_key,
+        )
+
+        # Get welink_session_id from metadata or from stored mapping
+        welink_session_id = metadata.get("welink_session_id") if metadata else None
+        if not welink_session_id:
+            welink_session_id = self._session_welink_ids.get(session_key)
+
+        # Build approval properties using permission.ask event type
+        properties = {
+            "permissionId": approval_id,  # Gateway schema expected field
+            "id": approval_id,            # Fallback for compatibility
+            "title": "⚠️ Dangerous Command Approval",
+            "text": f"Command: {command[:200]}\n\nReason: {description}",
+            "sessionKey": session_key,
+            "options": [
+                {"id": "once", "text": "Approve Once"},
+                {"id": "session", "text": "Approve for Session"},
+                {"id": "always", "text": "Always Approve"},
+                {"id": "deny", "text": "Deny"},
+            ],
+        }
+
+        # Send permission.ask event
+        success = await self._gateway.send_skill_event(
+            tool_session_id=chat_id,
+            event_type="permission.ask",
+            properties=properties,
+        )
+
+        if success:
+            logger.info("welink.exec_approval.sent: approval_id=%s", approval_id)
+            return SendResult(success=True, message_id=approval_id)
+        else:
+            logger.error("welink.exec_approval.send_failed")
+            # Clean up state on failure
+            self._exec_approval_state.pop(approval_id, None)
+            return SendResult(success=False, error="Failed to send permission.ask event")
 
     async def send_clarify(
         self,
