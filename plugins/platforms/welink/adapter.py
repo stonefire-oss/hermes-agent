@@ -42,11 +42,15 @@ from plugins.platforms.welink.protocol import (
     ErrorCode,
     GatewayConnection,
     MAX_MESSAGE_LENGTH,
+    MarkdownChunker,
     ReconnectConfig,
     SessionMapping,
     SubagentMapping,
     DEFAULT_GATEWAY_URL,
     DEFAULT_CHANNEL,
+    DEFAULT_MAX_CHUNK_SIZE,
+    DEFAULT_CHUNK_DELAY_MS,
+    DEFAULT_OVERSIZE_HANDLING,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,6 +129,13 @@ class WeLinkAdapter(BasePlatformAdapter):
         # Parse security configuration (access control)
         self._access_control = self._parse_access_control(config)
 
+        # Parse chunking configuration
+        self._chunking_config = self._parse_chunking_config(config)
+        self._chunker = MarkdownChunker(
+            max_chunk_size=self._chunking_config["max_chunk_size"],
+            oversize_handling=self._chunking_config["oversize_handling"],
+        )
+
         # Gateway connection
         self._gateway: Optional[GatewayConnection] = None
 
@@ -150,8 +161,44 @@ class WeLinkAdapter(BasePlatformAdapter):
             extra={
                 "gateway_url": self._bridge_config.gateway_url,
                 "channel": self._bridge_config.channel,
+                "chunking": self._chunking_config,
             },
         )
+
+    def _parse_chunking_config(self, config: PlatformConfig) -> Dict[str, Any]:
+        """Parse chunking configuration from PlatformConfig.
+        
+        Configuration in config.yaml under platforms.welink.extra.chunking:
+            chunking:
+                enabled: true
+                max_chunk_size: 2000
+                chunk_delay_ms: 500
+                oversize_handling: "warn"
+        
+        Environment variables:
+            WELINK_MAX_CHUNK_SIZE
+            WELINK_CHUNK_DELAY_MS
+            WELINK_OVERSIZE_HANDLING
+        """
+        extra = config.extra or {}
+        chunking = extra.get("chunking", {})
+        
+        return {
+            "enabled": chunking.get("enabled", True),
+            "max_chunk_size": int(
+                chunking.get("max_chunk_size") 
+                or os.getenv("WELINK_MAX_CHUNK_SIZE") 
+                or DEFAULT_MAX_CHUNK_SIZE
+            ),
+            "chunk_delay_ms": int(
+                chunking.get("chunk_delay_ms")
+                or os.getenv("WELINK_CHUNK_DELAY_MS")
+                or DEFAULT_CHUNK_DELAY_MS
+            ),
+            "oversize_handling": chunking.get("oversize_handling") 
+                or os.getenv("WELINK_OVERSIZE_HANDLING") 
+                or DEFAULT_OVERSIZE_HANDLING,
+        }
 
     def _parse_bridge_config(self, config: PlatformConfig) -> BridgeConfig:
         """Parse BridgeConfig from PlatformConfig."""
@@ -438,6 +485,11 @@ class WeLinkAdapter(BasePlatformAdapter):
         
         Gateway schema returns permissionId and response ('once', 'always', 'cancel', 'session', 'deny').
         
+        Response mapping by scenario:
+          exec_approval:  once→once, always→always, session→session, deny→deny, reject→deny, cancel→deny
+          slash_confirm:  once→once, always→always, session→once,   deny→cancel, reject→cancel, cancel→cancel
+          (unknown values default to deny for exec_approval, cancel for slash_confirm)
+        
         Two sources:
         1. exec_approval: permission_id in _exec_approval_state -> call resolve_gateway_approval()
         2. slash_confirm: permission_id in _confirm_session_keys -> call slash_confirm.resolve()
@@ -468,8 +520,18 @@ class WeLinkAdapter(BasePlatformAdapter):
             # Import and call resolve_gateway_approval
             from tools.approval import resolve_gateway_approval
             
-            # Map response to choice: once/session/always/deny
-            choice = response  # Gateway already sends 'once', 'session', 'always', 'deny'
+            # Map Gateway response to exec_approval choice
+            # Gateway sends: once, always, session, deny, cancel
+            # resolve_gateway_approval expects: once, session, always, deny
+            _EXEC_APPROVAL_MAP = {
+                "once": "once",
+                "always": "always",
+                "session": "session",
+                "deny": "deny",
+                "reject": "deny",   # WeLink UI sends 'reject' instead of 'deny'
+                "cancel": "deny",   # cancel → deny: user dismissed the prompt
+            }
+            choice = _EXEC_APPROVAL_MAP.get(response, "deny")  # unknown → safe default
             
             # Resolve the approval (unblocks agent thread)
             resolved_count = resolve_gateway_approval(session_key, choice)
@@ -508,7 +570,20 @@ class WeLinkAdapter(BasePlatformAdapter):
                 pending,
             )
             
-            result = await slash_confirm_mod.resolve(session_key, permission_id, response)
+            # Map Gateway response to slash_confirm choice
+            # Gateway sends: once, always, session, deny, cancel
+            # slash_confirm.resolve expects: once, always, cancel
+            _SLASH_CONFIRM_MAP = {
+                "once": "once",
+                "always": "always",
+                "session": "once",  # slash_confirm has no session scope → treat as once
+                "deny": "cancel",   # deny → cancel: user rejected the prompt
+                "reject": "cancel", # WeLink UI sends 'reject' instead of 'deny'
+                "cancel": "cancel",
+            }
+            choice = _SLASH_CONFIRM_MAP.get(response, "cancel")  # unknown → safe default
+            
+            result = await slash_confirm_mod.resolve(session_key, permission_id, choice)
             logger.info(
                 "welink.permission_reply.resolved: permission_id=%s response=%s result=%s",
                 permission_id,
@@ -611,10 +686,13 @@ class WeLinkAdapter(BasePlatformAdapter):
 
         Uses Skill Provider Event protocol (protocol: "cloud") with:
         - step.start: marks message start
-        - text.delta: streaming text content
-        - text.done: marks text complete
+        - text.delta: streaming text content (multiple chunks if needed)
+        - text.done: marks each chunk complete
         - step.done: marks message done
         - tool_done: final signal
+
+        If message exceeds max_chunk_size, it will be split into multiple
+        chunks respecting Markdown structural boundaries (code blocks, tables).
         """
         if self._gateway is None or self._gateway.state != ConnectionState.READY:
             logger.warning("welink.send.not_connected")
@@ -622,59 +700,123 @@ class WeLinkAdapter(BasePlatformAdapter):
 
         welink_session_id = metadata.get("welink_session_id") if metadata else None
 
-        # Truncate if needed
-        text = content
-        if len(text) > self.MAX_MESSAGE_LENGTH:
-            text = self.truncate_message(text, self.MAX_MESSAGE_LENGTH)
-
         # Generate IDs for Skill Provider Event format
         message_id = str(uuid.uuid4())
-        part_id = f"prt_{message_id[:8]}"
+        
+        # Check if chunking is needed
+        text = content
+        if len(text) <= self._chunking_config["max_chunk_size"]:
+            # Single chunk - send directly
+            chunks = [(text, "normal")]
+        else:
+            # Multiple chunks - use MarkdownChunker
+            chunks = self._chunker.chunk(text)
+            
+            # Log chunking details
+            logger.info(
+                "welink.send.chunked",
+                extra={
+                    "message_id": message_id,
+                    "original_length": len(text),
+                    "total_chunks": len(chunks),
+                    "chunk_sizes": [len(c) for c, t in chunks],
+                    "chunk_types": [t for c, t in chunks],
+                },
+            )
+            
+            # Warn about oversize chunks
+            for i, (chunk_text, chunk_type) in enumerate(chunks):
+                if chunk_type in ("oversize", "code_block", "table", "contains_code_block", "contains_table"):
+                    if len(chunk_text) > self._chunking_config["max_chunk_size"]:
+                        logger.warning(
+                            "welink.send.oversize_chunk",
+                            extra={
+                                "message_id": message_id,
+                                "chunk_index": i,
+                                "chunk_type": chunk_type,
+                                "chunk_size": len(chunk_text),
+                                "max_chunk_size": self._chunking_config["max_chunk_size"],
+                            },
+                        )
 
-        # Send step.start
-        await self._gateway.send_skill_event(
-            tool_session_id=chat_id,
-            event_type="step.start",
-            properties={"messageId": message_id},
-        )
+        # Send each chunk as an independent step cycle
+        # Each chunk gets its own messageId so WeLink renders it as a separate message
+        chunk_delay_s = self._chunking_config["chunk_delay_ms"] / 1000.0
+        first_message_id = None
+        
+        for i, (chunk_text, chunk_type) in enumerate(chunks):
+            # Each chunk gets its own messageId
+            chunk_message_id = str(uuid.uuid4())
+            if i == 0:
+                first_message_id = chunk_message_id
+            
+            part_id = f"prt_{chunk_message_id[:8]}"
+            
+            # Truncate chunk if still exceeds MAX_MESSAGE_LENGTH (hard limit)
+            if len(chunk_text) > self.MAX_MESSAGE_LENGTH:
+                original_len = len(chunk_text)
+                chunk_text = self.truncate_message(chunk_text, self.MAX_MESSAGE_LENGTH)
+                logger.warning(
+                    "welink.send.chunk_truncated",
+                    extra={
+                        "message_id": chunk_message_id,
+                        "chunk_index": i,
+                        "original_length": original_len,
+                        "truncated_length": len(chunk_text),
+                    },
+                )
+            
+            # step.start for this chunk
+            await self._gateway.send_skill_event(
+                tool_session_id=chat_id,
+                event_type="step.start",
+                properties={"messageId": chunk_message_id},
+            )
 
-        # Send text.delta
-        await self._gateway.send_skill_event(
-            tool_session_id=chat_id,
-            event_type="text.delta",
-            properties={
-                "messageId": message_id,
-                "partId": part_id,
-                "content": text,
-            },
-        )
+            # text.delta for this chunk
+            await self._gateway.send_skill_event(
+                tool_session_id=chat_id,
+                event_type="text.delta",
+                properties={
+                    "messageId": chunk_message_id,
+                    "partId": part_id,
+                    "content": chunk_text,
+                },
+            )
 
-        # Send text.done
-        await self._gateway.send_skill_event(
-            tool_session_id=chat_id,
-            event_type="text.done",
-            properties={
-                "messageId": message_id,
-                "partId": part_id,
-                "content": text,
-            },
-        )
+            # text.done for this chunk
+            await self._gateway.send_skill_event(
+                tool_session_id=chat_id,
+                event_type="text.done",
+                properties={
+                    "messageId": chunk_message_id,
+                    "partId": part_id,
+                    "content": chunk_text,
+                },
+            )
 
-        # Send step.done
-        await self._gateway.send_skill_event(
-            tool_session_id=chat_id,
-            event_type="step.done",
-            properties={"messageId": message_id},
-        )
+            # step.done for this chunk
+            await self._gateway.send_skill_event(
+                tool_session_id=chat_id,
+                event_type="step.done",
+                properties={"messageId": chunk_message_id},
+            )
+            
+            # Add delay between chunks (except for last chunk)
+            if i < len(chunks) - 1 and chunk_delay_s > 0:
+                await asyncio.sleep(chunk_delay_s)
 
-        # Send tool_done
+        # Send tool_done (only once after all chunks)
         await self._gateway.send_tool_done(
             tool_session_id=chat_id,
             welink_session_id=welink_session_id,
         )
 
-        logger.info("welink.send.success: message_id=%s", message_id)
-        return SendResult(success=True, message_id=message_id)
+        logger.info(
+            "welink.send.success: message_id=%s total_chunks=%d",
+            first_message_id, len(chunks),
+        )
+        return SendResult(success=True, message_id=first_message_id or message_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via session.status event."""

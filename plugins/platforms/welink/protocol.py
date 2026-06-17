@@ -58,6 +58,11 @@ DEFAULT_RECONNECT_MAX_ELAPSED_MS = 600000  # 10 minutes
 DEFAULT_SDK_TIMEOUT_MS = 10000
 MAX_MESSAGE_LENGTH = 4000  # WeLink typical limit
 
+# Message chunking defaults
+DEFAULT_MAX_CHUNK_SIZE = 2000  # Default max chars per chunk
+DEFAULT_CHUNK_DELAY_MS = 500   # Default delay between chunks (ms)
+DEFAULT_OVERSIZE_HANDLING = "warn"  # warn or split
+
 # WebSocket close codes that indicate rejection (no reconnect)
 GATEWAY_REJECTION_CLOSE_CODES = {4403, 4408, 4409}
 
@@ -473,11 +478,21 @@ class GatewayConnection:
         await self._send_raw(register_msg)
         logger.debug("gateway.register.sent")
 
-    async def _send_raw(self, msg: Dict[str, Any]) -> None:
-        """Send raw JSON message via WebSocket."""
+    async def _send_raw(self, msg: Dict[str, Any]) -> bool:
+        """Send raw JSON message via WebSocket.
+
+        Returns True if sent successfully, False if failed.
+        Logs detailed error information on failure.
+        """
         if self._ws is None or self._ws.closed:
-            logger.warning("gateway.send.closed")
-            return
+            logger.warning(
+                "gateway.send.closed",
+                extra={
+                    "msg_type": msg.get("type"),
+                    "toolSessionId": msg.get("toolSessionId"),
+                },
+            )
+            return False
 
         payload = json.dumps(msg, separators=(",", ":"))
         payload_bytes = len(payload.encode("utf-8"))
@@ -497,7 +512,40 @@ class GatewayConnection:
                 extra={"bytes": payload_bytes, "type": msg.get("type")},
             )
 
-        await self._ws.send_str(payload)
+        # Send with exception handling
+        try:
+            await self._ws.send_str(payload)
+        except aiohttp.ClientError as e:
+            # ClientError covers connection-related errors (disconnection, timeout, etc.)
+            logger.error(
+                "gateway.send.client_error",
+                extra={
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "msg_type": msg.get("type"),
+                    "event_type": event_type,
+                    "toolSessionId": msg.get("toolSessionId"),
+                    "payload_bytes": payload_bytes,
+                },
+            )
+            print(f"[GATEWAY SEND ERROR] ClientError: {type(e).__name__}: {e}")
+            return False
+        except Exception as e:
+            # Catch any other unexpected errors
+            logger.error(
+                "gateway.send.unexpected_error",
+                extra={
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "msg_type": msg.get("type"),
+                    "event_type": event_type,
+                    "toolSessionId": msg.get("toolSessionId"),
+                    "payload_bytes": payload_bytes,
+                },
+                exc_info=True,
+            )
+            print(f"[GATEWAY SEND ERROR] Unexpected: {type(e).__name__}: {e}")
+            return False
 
         # Track for debugging
         self._last_message_summary = {
@@ -516,6 +564,8 @@ class GatewayConnection:
             # Keep only last 3
             if len(self._recent_outbound_summaries) > 3:
                 self._recent_outbound_summaries.pop(0)
+
+        return True
 
     async def _receive_loop(self) -> None:
         """Receive messages from gateway."""
@@ -746,8 +796,7 @@ class GatewayConnection:
             msg["subagentSessionId"] = subagent_session_id
             msg["subagentName"] = subagent_name
 
-        await self._send_raw(msg)
-        return True
+        return await self._send_raw(msg)
 
     async def send_skill_event(
         self,
@@ -789,8 +838,7 @@ class GatewayConnection:
             },
         }
 
-        await self._send_raw(msg)
-        return True
+        return await self._send_raw(msg)
 
     async def send_tool_done(
         self,
@@ -811,8 +859,7 @@ class GatewayConnection:
         if usage:
             msg["usage"] = usage
 
-        await self._send_raw(msg)
-        return True
+        return await self._send_raw(msg)
 
     async def send_tool_error(
         self,
@@ -839,8 +886,7 @@ class GatewayConnection:
         if reason:
             msg["reason"] = reason
 
-        await self._send_raw(msg)
-        return True
+        return await self._send_raw(msg)
 
     async def send_session_created(
         self,
@@ -862,8 +908,7 @@ class GatewayConnection:
             },
         }
 
-        await self._send_raw(msg)
-        return True
+        return await self._send_raw(msg)
 
     async def send_status_response(self, online: bool) -> bool:
         """Send status_response for status_query."""
@@ -924,6 +969,248 @@ class GatewayConnection:
 
 
 # =============================================================================
-# WeLink Adapter
+# Markdown Chunker for Message Splitting
 # =============================================================================
+
+class MarkdownChunker:
+    """Split Markdown text into chunks respecting structural boundaries.
+    
+    This chunker preserves Markdown formatting by not splitting inside:
+    - Code blocks (``` ... ```)
+    - Tables (consecutive |...| lines with |---| separator)
+    - Inline links/images ([text](url), ![alt](url))
+    - Headers (# Title)
+    
+    Splitting priority:
+    1. Empty lines (paragraph boundaries) - BEST
+    2. Before/after tables (table boundaries)
+    3. Before headers (section boundaries)
+    4. Between list groups
+    5. Regular newlines (last resort, NOT inside tables)
+    """
+    
+    # Patterns for detecting structural boundaries
+    CODE_BLOCK_START = "```"
+    CODE_BLOCK_END = "```"
+    TABLE_ROW_PATTERN = r"^\|.*\|$"  # Lines starting and ending with |
+    TABLE_SEPARATOR_PATTERN = r"^\|[-:]+\|[-:]+\|$"  # |---|---| style separator
+    HEADER_PATTERN = r"^#{1,6}\s+"  # # ## ### etc.
+    LIST_PATTERN = r"^[*\-\+]\s+|^\d+\.\s+"  # - item, * item, 1. item
+    LINK_PATTERN = r"\[[^\]]*\]\([^)]*\)"  # [text](url)
+    IMAGE_PATTERN = r"!\[[^\]]*\]\([^)]*\)"  # ![alt](url)
+    
+    def __init__(
+        self,
+        max_chunk_size: int = DEFAULT_MAX_CHUNK_SIZE,
+        oversize_handling: str = DEFAULT_OVERSIZE_HANDLING,
+    ):
+        self.max_chunk_size = max_chunk_size
+        self.oversize_handling = oversize_handling
+    
+    def chunk(self, text: str) -> List[Tuple[str, str]]:
+        """Split text into chunks with metadata.
+        
+        Returns list of (chunk_text, chunk_type) tuples.
+        chunk_type indicates: "normal", "code_block", "table", "oversize"
+        """
+        if len(text) <= self.max_chunk_size:
+            return [(text, "normal")]
+        
+        # Identify protected ranges (cannot split inside)
+        protected_ranges = self._find_protected_ranges(text)
+        
+        # Find split points outside protected ranges
+        split_points = self._find_split_points(text, protected_ranges)
+        
+        # Generate chunks
+        chunks = self._generate_chunks(text, split_points, protected_ranges)
+        
+        return chunks
+    
+    def _find_protected_ranges(self, text: str) -> List[Tuple[int, int, str]]:
+        """Find ranges that cannot be split inside.
+        
+        Returns list of (start, end, type) tuples.
+        """
+        import re
+        ranges = []
+        lines = text.split('\n')
+        offset = 0
+        
+        # Track code blocks
+        in_code_block = False
+        code_block_start = 0
+        
+        # Track tables
+        in_table = False
+        table_start = 0
+        table_has_separator = False
+        
+        for i, line in enumerate(lines):
+            line_start = offset
+            line_end = offset + len(line)
+            
+            # Code block detection
+            if line.strip().startswith(self.CODE_BLOCK_START):
+                if not in_code_block:
+                    in_code_block = True
+                    code_block_start = line_start
+                else:
+                    # End of code block
+                    ranges.append((code_block_start, line_end + 1, "code_block"))
+                    in_code_block = False
+            
+            # Table detection (only if not in code block)
+            elif not in_code_block:
+                is_table_row = bool(re.match(self.TABLE_ROW_PATTERN, line.strip()))
+                is_separator = bool(re.match(self.TABLE_SEPARATOR_PATTERN, line.strip()))
+                
+                if is_table_row:
+                    if is_separator:
+                        table_has_separator = True
+                    if not in_table:
+                        in_table = True
+                        table_start = line_start
+                        table_has_separator = is_separator
+                else:
+                    # Non-table line - end table if we were in one
+                    if in_table and table_has_separator:
+                        # Table ends at previous line
+                        ranges.append((table_start, line_start, "table"))
+                    in_table = False
+                    table_has_separator = False
+            
+            offset = line_end + 1  # +1 for the newline
+        
+        # Handle unclosed structures
+        if in_code_block:
+            ranges.append((code_block_start, len(text), "code_block"))
+        if in_table and table_has_separator:
+            ranges.append((table_start, len(text), "table"))
+        
+        return ranges
+    
+    def _find_split_points(
+        self,
+        text: str,
+        protected_ranges: List[Tuple[int, int, str]]
+    ) -> List[int]:
+        """Find valid split points (positions where we can split).
+        
+        Returns list of character positions.
+        """
+        import re
+        split_points = []
+        
+        # Check if position is inside a protected range
+        def is_protected(pos: int) -> bool:
+            for start, end, _ in protected_ranges:
+                if start < pos < end:  # Allow splitting at boundaries
+                    return True
+            return False
+        
+        # Priority 1: Empty lines (paragraph boundaries)
+        for i, char in enumerate(text):
+            if i > 0 and text[i-1] == '\n' and char == '\n':
+                if not is_protected(i):
+                    split_points.append(i)
+        
+        # Priority 2: Single newline (if no empty lines found nearby)
+        # But NOT inside tables
+        lines = text.split('\n')
+        offset = 0
+        for i, line in enumerate(lines):
+            line_end = offset + len(line)
+            if line_end < len(text) and not is_protected(line_end + 1):
+                # Check if this newline is not already covered by empty line
+                if line_end + 1 not in split_points:
+                    # Don't split right after table rows
+                    if not re.match(self.TABLE_ROW_PATTERN, line.strip()):
+                        split_points.append(line_end + 1)
+            offset = line_end + 1
+        
+        return sorted(set(split_points))
+    
+    def _generate_chunks(
+        self,
+        text: str,
+        split_points: List[int],
+        protected_ranges: List[Tuple[int, int, str]]
+    ) -> List[Tuple[str, str]]:
+        """Generate chunks based on split points and protected ranges."""
+        chunks = []
+        
+        if not split_points:
+            # No valid split points - entire text is one chunk
+            chunk_type = self._determine_chunk_type(0, len(text), protected_ranges)
+            if len(text) > self.max_chunk_size:
+                logger.warning(
+                    "markdown_chunker.no_split_points",
+                    extra={
+                        "text_length": len(text),
+                        "max_chunk_size": self.max_chunk_size,
+                        "chunk_type": chunk_type,
+                    }
+                )
+            return [(text, chunk_type)]
+        
+        # Add boundaries
+        boundaries = [0] + split_points + [len(text)]
+        
+        current_chunk_start = 0
+        current_chunk_text = ""
+        
+        for i in range(1, len(boundaries)):
+            segment_start = boundaries[i-1]
+            segment_end = boundaries[i]
+            segment = text[segment_start:segment_end]
+            
+            # Check if adding this segment would exceed limit
+            if len(current_chunk_text) + len(segment) <= self.max_chunk_size:
+                current_chunk_text += segment
+            else:
+                # Save current chunk and start new one
+                if current_chunk_text:
+                    chunk_type = self._determine_chunk_type(
+                        current_chunk_start, 
+                        boundaries[i-1], 
+                        protected_ranges
+                    )
+                    chunks.append((current_chunk_text.strip(), chunk_type))
+                
+                current_chunk_start = segment_start
+                current_chunk_text = segment
+        
+        # Add final chunk
+        if current_chunk_text.strip():
+            chunk_type = self._determine_chunk_type(
+                current_chunk_start, 
+                len(text), 
+                protected_ranges
+            )
+            chunks.append((current_chunk_text.strip(), chunk_type))
+        
+        return chunks
+    
+    def _determine_chunk_type(
+        self,
+        start: int,
+        end: int,
+        protected_ranges: List[Tuple[int, int, str]]
+    ) -> str:
+        """Determine the type of a chunk based on protected ranges."""
+        for p_start, p_end, p_type in protected_ranges:
+            # If chunk overlaps significantly with a protected range
+            if start >= p_start and end <= p_end:
+                return p_type
+            if p_start >= start and p_end <= end:
+                # Protected range is inside chunk - mark as oversize
+                if p_type in ("code_block", "table"):
+                    return f"contains_{p_type}"
+        
+        # Check if chunk is oversize
+        if end - start > self.max_chunk_size:
+            return "oversize"
+        
+        return "normal"
 
